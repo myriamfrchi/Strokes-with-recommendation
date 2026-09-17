@@ -3,7 +3,7 @@ import { Info, ChevronDown, X } from "lucide-react";
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-const patientIds = ["1011", "1042", "1078", "1095", "1130"];
+const patientIds = ["dfngrvjkictscmy", "uznrjkmtisetxsg", "azexpgpszpmglxf", "uthjemmvtwogzcc", "mcnjbkdjdsycrjf", "xvyeentnlfrcyyx"];
 
 interface SliderConfig {
   key: string;
@@ -584,7 +584,6 @@ function RiskGauge({ pct }: { pct: number }) {
       <div className="text-center -mt-1">
         <div className="text-xl font-bold" style={{ color: mrsColor }}>mRS {mrs}</div>
         <div className="text-xs text-gray-500 leading-tight">{MRS_LABELS[mrs]}</div>
-        <div className="text-[10px] text-gray-400">{pct}% overall risk</div>
       </div>
     </div>
   );
@@ -687,20 +686,82 @@ const initialBools: Record<string, boolean> = {
   Discharge_anticoagulents_any: false,
 };
 
-// Sliders that have distribution charts (continuous, non-discrete, not tiles)
+// ── LIGNE AJOUTÉE ICI ────────────────────────────────────────────────────────
 const CHART_SLIDERS = SLIDERS.filter((s) => FACTOR_META[s.key]);
 
+// Sliders that have distribution charts (continuous, non-discrete, not tiles)
 export default function App() {
-  const [patientId, setPatientId] = useState("1011");
-  const [baseline] = useState<Record<string, number>>(initialValues);
+  // 1. Les "mémoires" de l'interface (on met ton patient de test par défaut)
+  const [patientId, setPatientId] = useState("dfngrvjkictscmy");
+  const [baseline, setBaseline] = useState<Record<string, number>>(initialValues);
   const [values, setValues] = useState<Record<string, number>>(initialValues);
   const [boolValues, setBoolValues] = useState<Record<string, boolean>>(initialBools);
+  
+  // Nouvelle mémoire pour stocker toutes les données brutes du patient
+  const [patientData, setPatientData] = useState<any>(null);
 
+  // 2. Le déclencheur API (s'exécute à chaque changement de patientId)
+  useEffect(() => {
+    const fetchPatient = async () => {
+      if (!patientId) return;
+
+      try {
+        const response = await fetch(`http://127.0.0.1:8000/patient/${patientId}`);
+        if (response.ok) {
+          const data = await response.json();
+          const p = data.donnees;
+          
+          setPatientData(p);
+          console.log("✅ Données patient :", p);
+
+          // On met à jour les sliders avec les vraies valeurs du patient
+          setValues((prev) => {
+            const newVals = { ...prev };
+            Object.keys(newVals).forEach((key) => {
+              if (p[key] !== undefined && p[key] !== null) newVals[key] = Number(p[key]);
+            });
+            return newVals;
+          });
+
+          // On définit la baseline avec ces mêmes valeurs
+          setBaseline((prev) => {
+            const newBase = { ...prev };
+            Object.keys(newBase).forEach((key) => {
+              if (p[key] !== undefined && p[key] !== null) newBase[key] = Number(p[key]);
+            });
+            return newBase;
+          });
+
+          // On met à jour les toggles booléens
+          setBoolValues((prev) => {
+            const newBools = { ...prev };
+            Object.keys(newBools).forEach((key) => {
+              if (p[key] !== undefined && p[key] !== null) newBools[key] = Boolean(p[key]);
+            });
+            return newBools;
+          });
+        }
+      } catch (error) {
+        console.error("❌ Erreur de connexion API :", error);
+      }
+    };
+
+    fetchPatient();
+  }, [patientId]);
+
+  // 3. Calculs internes (à remplacer plus tard par la route /predict)
   const risk = overallRisk(values, boolValues);
   const recs = getRecommendations(values, boolValues);
 
-  const patientInfo: [string, React.ReactNode][] = [
-    ["Age", "65"], ["Pulse", "80"], ["Region", "Drava"], ["Institution", "01"], ["Gender", "Male"],
+  // 4. Infos patient dynamiques (si on a les données, on les affiche, sinon on met des tirets)
+  const patientInfo: [string, React.ReactNode][] = patientData ? [
+    ["Age", patientData.age || "-"], 
+    ["Gender", patientData.gender || "-"], 
+    ["Stroke Type", patientData.stroke_type || "-"], 
+    ["Pre-stroke mRS", patientData.prestroke_mrs || "-"],
+    ["mRS Discharge", patientData.discharge_mrs || "-"]
+  ] : [
+    ["Age", "-"], ["Gender", "-"], ["Stroke Type", "-"], ["Pre-stroke mRS", "-"], ["mRS Discharge", "-"]
   ];
 
   return (
