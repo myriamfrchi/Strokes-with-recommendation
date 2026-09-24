@@ -421,7 +421,22 @@ function tracéLisse(
 function ShapCurveChart({ cfg, variable, value }: {
   cfg: SliderConfig; variable: ShapVariable; value: number;
 }) {
-  const W = 220, H = 72, PX = 10, PY = 10, BAS = 12;
+  // La colonne fait 430 px a 1280 et 800 px a 1920 : une largeur fixe gacherait
+  // la moitie de la place. On mesure le conteneur et on s'y adapte, ce qui
+  // garde les textes et le point a leur taille reelle (pas d'etirement).
+  const boite = useRef<HTMLDivElement>(null);
+  const [W, setW] = useState(360);
+  useEffect(() => {
+    const el = boite.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([entree]) => {
+      setW(Math.max(280, Math.round(entree.contentRect.width)));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const H = 88, PX = 12, PY = 12, BAS = 17;
   const plotH = H - PY - BAS;
   const segs = segments(cfg, variable);
 
@@ -433,7 +448,7 @@ function ShapCurveChart({ cfg, variable, value }: {
   const paliers = segs.map((seg) => ({
     x0: toX(seg.debut), x1: toX(seg.fin), y: toY(seg.shap),
   }));
-  const trace = tracéLisse(paliers, 13);
+  const trace = tracéLisse(paliers, Math.min(26, W * 0.06));
   // meme trace referme sur la ligne du zero, pour l'aire
   const aire = `${trace} L ${paliers[paliers.length - 1].x1.toFixed(1)} ${zeroY.toFixed(1)}`
              + ` L ${paliers[0].x0.toFixed(1)} ${zeroY.toFixed(1)} Z`;
@@ -444,7 +459,8 @@ function ShapCurveChart({ cfg, variable, value }: {
   const yPatient = courant ? toY(courant.shap) : zeroY;
 
   return (
-    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="shrink-0">
+    <div ref={boite} className="w-full">
+      <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`}>
       {/* aire sous la courbe, teintee par le signe de l'effet sur chaque palier */}
       <defs>
         <linearGradient id={gradId} gradientUnits="userSpaceOnUse" x1={PX} x2={W - PX}>
@@ -468,13 +484,13 @@ function ShapCurveChart({ cfg, variable, value }: {
       {segs.slice(1).map((seg, i) => {
         const x = toX(seg.debut);
         const precedent = i > 0 ? toX(segs[i].debut) : -Infinity;
-        const lisible = x - PX > 30 && (W - PX) - x > 20 && x - precedent > 14;
+        const lisible = x - PX > 42 && (W - PX) - x > 28 && x - precedent > 22;
         return (
           <g key={`s${seg.classe}`}>
             <line x1={x} y1={PY} x2={x} y2={PY + plotH}
               stroke="#cbd5e1" strokeWidth={1} strokeDasharray="2 2" />
             {lisible && (
-              <text x={x} y={H - 2} fontSize={6.5} fill="#64748b"
+              <text x={x} y={H - 3} fontSize={9.5} fill="#64748b"
                 textAnchor="middle" fontWeight="600">
                 {Math.round(seg.debut)}
               </text>
@@ -489,21 +505,22 @@ function ShapCurveChart({ cfg, variable, value }: {
       {/* position du patient */}
       <line x1={xPatient} y1={yPatient} x2={xPatient} y2={PY + plotH}
         stroke="#ef4444" strokeWidth={1} strokeDasharray="2.5 2" />
-      <circle cx={xPatient} cy={yPatient} r={4} fill="#ef4444" stroke="white" strokeWidth={1.5} />
-      <text x={xPatient} y={yPatient - 6 < PY + 6 ? yPatient + 11 : yPatient - 6}
-        fontSize={7.5} fontWeight="700" fill="#ef4444"
-        textAnchor={xPatient < PX + 28 ? "start" : xPatient > W - PX - 28 ? "end" : "middle"}>
+      <circle cx={xPatient} cy={yPatient} r={5} fill="#ef4444" stroke="white" strokeWidth={1.8} />
+      <text x={xPatient} y={yPatient - 9 < PY + 9 ? yPatient + 16 : yPatient - 9}
+        fontSize={11.5} fontWeight="700" fill="#ef4444"
+        textAnchor={xPatient < PX + 40 ? "start" : xPatient > W - PX - 40 ? "end" : "middle"}>
         {courant ? `${courant.shap > 0 ? "+" : ""}${courant.shap.toFixed(2)}` : ""}
       </text>
 
-      <text x={PX} y={H - 2} fontSize={6.5} fill="#9ca3af" textAnchor="start">
+      <text x={PX} y={H - 3} fontSize={9.5} fill="#9ca3af" textAnchor="start">
         {cfg.min}{cfg.unit ? ` ${cfg.unit}` : ""}
       </text>
-      <text x={W - PX} y={H - 2} fontSize={6.5} fill="#9ca3af" textAnchor="end">{cfg.max}</text>
-      <text x={PX} y={PY - 3} fontSize={6} fill="#9ca3af" textAnchor="start">
+      <text x={W - PX} y={H - 3} fontSize={9.5} fill="#9ca3af" textAnchor="end">{cfg.max}</text>
+      <text x={PX} y={PY - 3} fontSize={8} fill="#9ca3af" textAnchor="start">
         effet SHAP sur le mRS
       </text>
-    </svg>
+      </svg>
+    </div>
   );
 }
 
@@ -545,7 +562,7 @@ function FactorRow({ cfg, value, variable }: {
       <div className="flex-1 min-w-0">
         {variable
           ? <ShapCurveChart cfg={cfg} variable={variable} value={value} />
-          : <div className="h-[72px] flex items-center text-[10px] text-gray-300">
+          : <div className="h-[88px] flex items-center text-[10px] text-gray-300">
               en attente du modele…
             </div>}
       </div>
