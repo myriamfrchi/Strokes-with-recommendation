@@ -30,7 +30,7 @@ const SLIDERS: SliderConfig[] = [
   { key: "sysBP",          label: "Sys Blood Pressure", min: 40,  max: 220, unit: "mmHg",  default: 150, dangerHigh: 140 },
   { key: "disBP",          label: "Dis Blood Pressure",  min: 40,  max: 140, unit: "mmHg",  default: 95,  dangerHigh: 90 },
   { key: "glucose",        label: "Glucose",             min: 50,  max: 400, unit: "mg/dL", default: 200, dangerHigh: 126 },
-  { key: "cholesterol",    label: "Cholesterol",         min: 100, max: 400, unit: "mg/dL", default: 260, dangerHigh: 200 },
+  { key: "cholesterol",    label: "Cholesterol",         min: 50,  max: 400, unit: "mg/dL", default: 260, dangerHigh: 200 },
   { key: "prestrokeMrs",   label: "Pre-stroke mRS",      min: 0,   max: 5,   unit: "",      default: 2,   dangerHigh: 2,  step: 1, noChart: true },
   { key: "doorToImaging",  label: "Door to Imaging",     min: 0,   max: 180, unit: "min",   default: 45,  dangerHigh: 60, lowerIsBetter: true, isTile: true },
   { key: "onsetToDoor",    label: "Onset to Door",       min: 0,   max: 600, unit: "min",   default: 180, dangerHigh: 120, lowerIsBetter: true, isTile: true },
@@ -41,7 +41,6 @@ const BOOL_PARAMS: BoolParam[] = [
   { key: "risk_hypertension",          label: "Hypertension",            group: "Risk Factors", riskIfTrue: true },
   { key: "risk_diabetes",              label: "Diabetes",                group: "Risk Factors", riskIfTrue: true },
   { key: "risk_smoker",                label: "Smoker",                  group: "Risk Factors", riskIfTrue: true },
-  { key: "risk_arterialfibrilation",   label: "Atrial Fibrillation",     group: "Risk Factors", riskIfTrue: true },
   { key: "prenotification",            label: "Pre-notification",        group: "Clinical",     riskIfTrue: false },
   { key: "hospitalized_in",            label: "Hospitalized In",         group: "Clinical",     riskIfTrue: false },
   { key: "bleeding_volume_value",      label: "Bleeding Volume",         group: "Clinical",     riskIfTrue: true },
@@ -50,6 +49,12 @@ const BOOL_PARAMS: BoolParam[] = [
   { key: "discharge_antiplatlets_any", label: "Antiplatelets",           group: "Discharge",    riskIfTrue: false },
   { key: "Discharge_anticoagulents_any", label: "Anticoagulants",        group: "Discharge",    riskIfTrue: false },
 ];
+
+// Fallback shown only until the API answers — never passed off as patient data.
+const initialValues = Object.fromEntries(SLIDERS.map((s) => [s.key, s.default]));
+const initialBools: Record<string, boolean> = Object.fromEntries(
+  BOOL_PARAMS.map((p) => [p.key, false]),
+);
 
 // ── Distribution metadata ────────────────────────────────────────────────────
 
@@ -103,40 +108,236 @@ const FACTOR_META: Record<string, FactorMeta> = {
   },
 };
 
+// ── API connection ───────────────────────────────────────────────────────────
+
+const API_BASE = String(
+  (import.meta as any).env?.VITE_API_URL ?? "http://127.0.0.1:8000",
+).replace(/\/+$/, "");
+
+type ApiRecord = Record<string, unknown>;
+
+/** Returns the first of `names` the payload actually carries a value for. */
+function readField(raw: ApiRecord, names: string[]): unknown {
+  for (const name of names) {
+    const v = raw[name];
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    return v;
+  }
+  return undefined;
+}
+
+function toNumber(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v.trim()) : NaN;
+  return Number.isFinite(n) ? n : undefined;
+}
+
+const TRUE_WORDS = new Set(["1", "true", "yes", "y", "oui", "done", "received", "present"]);
+const FALSE_WORDS = new Set(["0", "false", "no", "n", "non", "none", "absent", "recommended"]);
+
+/** The registry sends "0" / "1" as strings, and Boolean("0") is true — so every
+ *  flag has to go through this instead of a plain cast. */
+function toBool(v: unknown): boolean | undefined {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return Number.isFinite(v) ? v > 0 : undefined;
+  if (typeof v !== "string") return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === "") return undefined;
+  if (TRUE_WORDS.has(s)) return true;
+  if (FALSE_WORDS.has(s)) return false;
+  const n = Number(s);
+  return Number.isFinite(n) ? n > 0 : undefined;
+}
+
+/** The registry stores glucose and cholesterol in mmol/L, while this UI — its
+ *  thresholds, optimal ranges and the studies behind them — is in mg/dL. The
+ *  conversion only fires inside the plausible mmol/L band, so an API that
+ *  already sends mg/dL keeps working untouched. */
+function glucoseToMgdl(v: number) { return v < 50 ? v * 18.0182 : v; }
+function cholesterolToMgdl(v: number) { return v < 20 ? v * 38.665 : v; }
+
+/** Maps the payload onto the slider keys. The API serves the registry's
+ *  snake_case column names; without this table only `glucose` and
+ *  `cholesterol` lined up by name and every other factor silently kept its
+ *  hardcoded default. */
+/** Colonne du registre correspondant a chaque cle de l'interface. */
+const API_COLUMN: Record<string, string> = {
+  sysBP: "sys_blood_pressure", disBP: "dis_blood_pressure",
+  glucose: "glucose", cholesterol: "cholesterol", prestrokeMrs: "prestroke_mrs",
+  doorToImaging: "door_to_imaging", onsetToDoor: "onset_to_door",
+  doorToNeedle: "door_to_needle",
+};
+
+/** Retour vers l'unite du registre : l'ecran affiche des mg/dL convertis, mais
+ *  le modele a ete entraine sur les mmol/L bruts. Sans ca, une glycemie simulee
+ *  serait decoupee avec les mauvais seuils. */
+const VERS_REGISTRE: Record<string, (v: number) => number> = {
+  glucose: (v) => v / 18.0182,
+  cholesterol: (v) => v / 38.665,
+};
+
+function versRegistre(key: string, valeur: number) {
+  const f = VERS_REGISTRE[key];
+  return f ? f(valeur) : valeur;
+}
+
+const NUMERIC_SOURCES: Record<string, { from: string[]; convert?: (v: number) => number }> = {
+  sysBP:         { from: ["sys_blood_pressure", "sysBP"] },
+  disBP:         { from: ["dis_blood_pressure", "disBP"] },
+  glucose:       { from: ["glucose"], convert: glucoseToMgdl },
+  cholesterol:   { from: ["cholesterol"], convert: cholesterolToMgdl },
+  prestrokeMrs:  { from: ["prestroke_mrs", "prestrokeMrs"] },
+  doorToImaging: { from: ["door_to_imaging", "doorToImaging"] },
+  onsetToDoor:   { from: ["onset_to_door", "onsetToDoor"] },
+  doorToNeedle:  { from: ["door_to_needle", "doorToNeedle"] },
+};
+
+const ANTIPLATELETS = [
+  "discharge_clopidrogel", "discharge_prasugrel", "discharge_ticagrelor",
+  "discharge_ticlopidine", "discharge_cilostazol", "discharge_dipyridamol",
+];
+const ANTICOAGULANTS = [
+  "discharge_apixaban", "discharge_dabigatran", "discharge_edoxaban",
+  "discharge_rivaroxaban", "discharge_warfarin", "discharge_heparin",
+];
+
+/** True as soon as one drug of the family is flagged; undefined while none of
+ *  them is known, so an unknown family keeps its fallback instead of "off". */
+function anyDrug(raw: ApiRecord, columns: string[]): boolean | undefined {
+  let known = false;
+  for (const c of columns) {
+    const b = toBool(raw[c]);
+    if (b === undefined) continue;
+    known = true;
+    if (b) return true;
+  }
+  return known ? false : undefined;
+}
+
+const BOOL_SOURCES: Record<string, (raw: ApiRecord) => boolean | undefined> = {
+  risk_hypertension: (r) => toBool(readField(r, ["risk_hypertension"])),
+  risk_diabetes:     (r) => toBool(readField(r, ["risk_diabetes"])),
+  risk_smoker:       (r) => toBool(readField(r, ["risk_smoker"])),
+  prenotification:   (r) => toBool(readField(r, ["prenotification"])),
+  // Categorical in the registry ("ICU/stroke unit" | "monitored bed" |
+  // "standard bed"): the toggle means "admitted to a stroke unit".
+  hospitalized_in: (r) => {
+    const v = readField(r, ["hospitalized_in"]);
+    if (v === undefined) return undefined;
+    const s = String(v).toLowerCase();
+    return s.includes("stroke unit") || s.includes("icu");
+  },
+  // Stored as a volume in mL, not as a flag.
+  bleeding_volume_value: (r) => {
+    const n = toNumber(readField(r, ["bleeding_volume_value"]));
+    return n === undefined ? undefined : n > 0;
+  },
+  imaging_done:                 (r) => toBool(readField(r, ["imaging_done"])),
+  occup_physiotherapy_received: (r) => toBool(readField(r, ["occup_physiotherapy_received"])),
+  // The registry has no aggregate column for either family, so these are
+  // derived from the individual discharge drugs — the same six columns the
+  // modelling notebooks fold into `anticoagulant_discharge` via max(axis=1).
+  // An API already exposing an aggregate, under any of these names, wins.
+  discharge_antiplatlets_any: (r) => {
+    const direct = toBool(readField(r, [
+      "discharge_antiplatlets_any", "discharge_antiplatelets_any", "antiplatelet_discharge",
+    ]));
+    return direct !== undefined ? direct : anyDrug(r, ANTIPLATELETS);
+  },
+  Discharge_anticoagulents_any: (r) => {
+    const direct = toBool(readField(r, [
+      "Discharge_anticoagulents_any", "discharge_anticoagulents_any",
+      "discharge_anticoagulants_any", "anticoagulant_discharge",
+    ]));
+    return direct !== undefined ? direct : anyDrug(r, ANTICOAGULANTS);
+  },
+};
+
+function clampToRange(cfg: SliderConfig, v: number) {
+  const clamped = Math.max(cfg.min, Math.min(cfg.max, v));
+  const step = cfg.step ?? 1;
+  // Keeps the value on the grid the input accepts, so what the slider reports
+  // back and what the tiles display can never drift apart.
+  return Number((Math.round(clamped / step) * step).toFixed(6));
+}
+
+interface MappedPatient {
+  values: Record<string, number>;
+  bools: Record<string, boolean>;
+}
+
+function mapPatient(raw: ApiRecord): MappedPatient {
+  const values: Record<string, number> = { ...initialValues };
+  const bools: Record<string, boolean> = { ...initialBools };
+
+  for (const cfg of SLIDERS) {
+    const src = NUMERIC_SOURCES[cfg.key];
+    const n = src ? toNumber(readField(raw, src.from)) : undefined;
+    if (n === undefined) continue;   // keep the fallback for this key
+    values[cfg.key] = clampToRange(cfg, src.convert ? src.convert(n) : n);
+  }
+
+  for (const p of BOOL_PARAMS) {
+    const b = BOOL_SOURCES[p.key]?.(raw);
+    if (b !== undefined) bools[p.key] = b;
+  }
+
+  return { values, bools };
+}
+
+// ── Explication SHAP renvoyee par le modele ──────────────────────────────────
+
+interface ShapPoint { classe: number; shap: number; mrs: number }
+
+interface ShapVariable {
+  label: string;
+  unite: string;
+  valeur_brute: number | null;
+  classe_actuelle: number | null;
+  seuils: number[];
+  libelles_classes: string[];
+  shap_actuel: number;
+  courbe: ShapPoint[];
+}
+
+interface Explication {
+  patient: string;
+  simule: boolean;
+  prediction: { mrs: number; valeur_base: number };
+  variables: Record<string, ShapVariable>;
+}
+
+// ── Patient selection, kept across reloads ───────────────────────────────────
+
+const PATIENT_STORAGE_KEY = "swr.patientId";
+
+/** A reload keeps the patient that was on screen: ?patient= wins, then the
+ *  last selection, then the first id of the list. */
+function readInitialPatientId(): string {
+  if (typeof window === "undefined") return patientIds[0];
+  const fromUrl = new URLSearchParams(window.location.search).get("patient");
+  if (fromUrl) return fromUrl;
+  try {
+    const stored = window.localStorage.getItem(PATIENT_STORAGE_KEY);
+    if (stored) return stored;
+  } catch { /* storage unavailable (private mode) */ }
+  return patientIds[0];
+}
+
+function rememberPatientId(id: string) {
+  try { window.localStorage.setItem(PATIENT_STORAGE_KEY, id); } catch { /* ignore */ }
+  const url = new URL(window.location.href);
+  if (url.searchParams.get("patient") !== id) {
+    url.searchParams.set("patient", id);
+    window.history.replaceState(null, "", url);
+  }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function isAtRisk(cfg: SliderConfig, val: number) {
   if (cfg.dangerHigh === undefined) return false;
   return val > cfg.dangerHigh;
-}
-
-function riskScore(cfg: SliderConfig, val: number) {
-  if (cfg.lowerIsBetter) return Math.min(100, (val / cfg.max) * 100);
-  return Math.min(100, ((val - cfg.min) / (cfg.max - cfg.min)) * 100);
-}
-
-function overallRisk(values: Record<string, number>, boolValues: Record<string, boolean>) {
-  const sliderRisk =
-    SLIDERS.map((s) => riskScore(s, values[s.key])).reduce((a, b) => a + b, 0) / SLIDERS.length;
-
-  let boolPenalty = 0;
-  BOOL_PARAMS.forEach((p) => {
-    const isRisky = p.riskIfTrue ? boolValues[p.key] : !boolValues[p.key];
-    if (isRisky) boolPenalty += 8;
-  });
-  const maxBoolPenalty = BOOL_PARAMS.length * 8;
-  const boolRiskPct = (boolPenalty / maxBoolPenalty) * 100;
-
-  return Math.round(Math.min(100, sliderRisk * 0.65 + boolRiskPct * 0.35));
-}
-
-function mrsFromPct(pct: number): number {
-  if (pct >= 84) return 5;
-  if (pct >= 67) return 4;
-  if (pct >= 51) return 3;
-  if (pct >= 34) return 2;
-  if (pct >= 17) return 1;
-  return 0;
 }
 
 const MRS_COLORS = ["#22c55e", "#84cc16", "#eab308", "#f97316", "#ef4444", "#b91c1c"];
@@ -157,93 +358,150 @@ function usePopup() {
   return { open, setOpen, ref };
 }
 
-// ── Risk Curve Chart (Partial Dependence Plot) ────────────────────────────────
+// ── Courbe SHAP (dependance partielle issue du modele) ───────────────────────
 
-function RiskCurveChart({ cfg, meta, value }: { cfg: SliderConfig; meta: FactorMeta; value: number }) {
-  const W = 220, H = 72, PX = 8, PY = 6;
-  const plotW = W - PX * 2;
-  const plotH = H - PY - 18;
-  const N = 200;
-  const [optLow, optHigh] = meta.optimalRange;
-  const gradId = `rcg-${cfg.key}`;
+/** Conversion inverse de `versRegistre` : les seuils renvoyes par l'API sont
+ *  dans l'unite du registre, l'axe du graphe est dans celle de l'ecran. */
+const DEPUIS_REGISTRE: Record<string, (v: number) => number> = {
+  glucose: (v) => v * 18.0182,
+  cholesterol: (v) => v * 38.665,
+};
 
-  function riskAt(x: number): number {
-    const floor = 0.04;
-    if (x < optLow) {
-      const t = (optLow - x) / Math.max(1, optLow - cfg.min);
-      return floor + (1 - floor) * Math.pow(t, 1.8);
-    }
-    if (x > optHigh) {
-      const t = (x - optHigh) / Math.max(1, cfg.max - optHigh);
-      return floor + (1 - floor) * Math.pow(t, 1.8);
-    }
-    return floor;
+function depuisRegistre(key: string, valeur: number) {
+  const f = DEPUIS_REGISTRE[key];
+  return f ? f(valeur) : valeur;
+}
+
+/** Decoupe l'axe en segments [debut, fin] portant chacun la valeur SHAP de sa
+ *  classe. Un seuil hors de l'axe est simplement ignore : la classe couvre
+ *  alors toute la largeur, ce qui est exactement ce que dit le modele. */
+function segments(cfg: SliderConfig, variable: ShapVariable) {
+  const seuils = variable.seuils
+    .map((b) => depuisRegistre(cfg.key, b))
+    .filter((b) => b > cfg.min && b < cfg.max);
+  const bornes = [cfg.min, ...seuils, cfg.max];
+
+  return variable.courbe.slice(0, bornes.length - 1).map((pt, i) => ({
+    debut: bornes[i],
+    fin: bornes[i + 1],
+    shap: pt.shap,
+    classe: pt.classe,
+  }));
+}
+
+/** Trace lisse : palier horizontal par classe, puis transition en S centree sur
+ *  le seuil au lieu d'un angle droit. Chaque palier garde sa valeur SHAP exacte
+ *  et chaque bascule reste sur son seuil ; seule la marche est adoucie, sur une
+ *  largeur volontairement etroite pour ne pas suggerer une pente continue. */
+function tracéLisse(
+  paliers: { x0: number; x1: number; y: number }[],
+  largeurMax: number,
+) {
+  if (paliers.length === 0) return "";
+  const d = [`M ${paliers[0].x0.toFixed(1)} ${paliers[0].y.toFixed(1)}`];
+  for (let i = 1; i < paliers.length; i++) {
+    const seuil = paliers[i].x0;
+    const avant = paliers[i - 1];
+    // la transition ne doit jamais deborder sur le palier voisin
+    const w = Math.max(0.5, Math.min(largeurMax,
+      (seuil - avant.x0) / 2, (paliers[i].x1 - seuil) / 2));
+    d.push(`L ${(seuil - w).toFixed(1)} ${avant.y.toFixed(1)}`);
+    d.push(`C ${seuil.toFixed(1)} ${avant.y.toFixed(1)}, `
+         + `${seuil.toFixed(1)} ${paliers[i].y.toFixed(1)}, `
+         + `${(seuil + w).toFixed(1)} ${paliers[i].y.toFixed(1)}`);
   }
+  const dernier = paliers[paliers.length - 1];
+  d.push(`L ${dernier.x1.toFixed(1)} ${dernier.y.toFixed(1)}`);
+  return d.join(" ");
+}
 
-  function toSX(x: number) { return PX + ((x - cfg.min) / (cfg.max - cfg.min)) * plotW; }
-  function toSY(r: number) { return PY + (1 - r) * plotH; }
+/** Courbe lisse de dependance partielle.
+ *  C'est la forme honnete d'un graphe de dependance partielle sur une variable
+ *  discretisee — le modele ne change d'avis qu'au franchissement d'un seuil. */
+function ShapCurveChart({ cfg, variable, value }: {
+  cfg: SliderConfig; variable: ShapVariable; value: number;
+}) {
+  const W = 220, H = 72, PX = 10, PY = 10, BAS = 12;
+  const plotH = H - PY - BAS;
+  const segs = segments(cfg, variable);
 
-  const pts = Array.from({ length: N + 1 }, (_, i) => {
-    const x = cfg.min + (cfg.max - cfg.min) * (i / N);
-    return { x, r: riskAt(x) };
-  });
+  const ampli = Math.max(0.02, ...segs.map((s) => Math.abs(s.shap)));
+  const zeroY = PY + plotH / 2;
+  const toX = (v: number) => PX + ((v - cfg.min) / (cfg.max - cfg.min)) * (W - PX * 2);
+  const toY = (shap: number) => zeroY - (shap / ampli) * (plotH / 2);
 
-  const curvePts = pts.map((p) => `${toSX(p.x).toFixed(1)},${toSY(p.r).toFixed(1)}`).join(" ");
-  const bottomY = PY + plotH;
+  const paliers = segs.map((seg) => ({
+    x0: toX(seg.debut), x1: toX(seg.fin), y: toY(seg.shap),
+  }));
+  const trace = tracéLisse(paliers, 13);
+  // meme trace referme sur la ligne du zero, pour l'aire
+  const aire = `${trace} L ${paliers[paliers.length - 1].x1.toFixed(1)} ${zeroY.toFixed(1)}`
+             + ` L ${paliers[0].x0.toFixed(1)} ${zeroY.toFixed(1)} Z`;
+  const gradId = `pdp-${cfg.key}`;
 
-  const areaPath = [
-    `M ${PX} ${bottomY}`,
-    `L ${PX} ${toSY(pts[0].r).toFixed(1)}`,
-    ...pts.map((p) => `L ${toSX(p.x).toFixed(1)} ${toSY(p.r).toFixed(1)}`),
-    `L ${W - PX} ${bottomY}`,
-    "Z",
-  ].join(" ");
-
-  const dotX = toSX(value);
-  const dotY = toSY(riskAt(value));
-
-  const optLowPct = Math.max(0, Math.min(100, ((optLow - cfg.min) / (cfg.max - cfg.min)) * 100));
-  const optHighPct = Math.max(0, Math.min(100, ((optHigh - cfg.min) / (cfg.max - cfg.min)) * 100));
-  const optMidVal = Math.round((optLow + optHigh) / 2);
-
-  const labelAnchor = dotX < PX + 25 ? "start" : dotX > W - PX - 25 ? "end" : "middle";
+  const courant = segs.find((s) => s.classe === variable.classe_actuelle) ?? segs[0];
+  const xPatient = toX(Math.max(cfg.min, Math.min(cfg.max, value)));
+  const yPatient = courant ? toY(courant.shap) : zeroY;
 
   return (
     <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="shrink-0">
+      {/* aire sous la courbe, teintee par le signe de l'effet sur chaque palier */}
       <defs>
-        <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="0%">
-          <stop offset="0%"              stopColor="#ef4444" stopOpacity={0.5} />
-          <stop offset={`${optLowPct}%`} stopColor="#22c55e" stopOpacity={0.35} />
-          <stop offset={`${optHighPct}%`} stopColor="#22c55e" stopOpacity={0.35} />
-          <stop offset="100%"            stopColor="#ef4444" stopOpacity={0.5} />
+        <linearGradient id={gradId} gradientUnits="userSpaceOnUse" x1={PX} x2={W - PX}>
+          {segs.flatMap((seg) => {
+            const c = seg.shap >= 0 ? "#ef4444" : "#22c55e";
+            const o0 = (toX(seg.debut) - PX) / (W - PX * 2);
+            const o1 = (toX(seg.fin) - PX) / (W - PX * 2);
+            return [
+              <stop key={`${seg.classe}a`} offset={o0} stopColor={c} />,
+              <stop key={`${seg.classe}b`} offset={o1} stopColor={c} />,
+            ];
+          })}
         </linearGradient>
       </defs>
+      <path d={aire} fill={`url(#${gradId})`} opacity={0.16} />
 
-      {/* Gradient area under curve */}
-      <path d={areaPath} fill={`url(#${gradId})`} />
+      <line x1={PX} y1={zeroY} x2={W - PX} y2={zeroY} stroke="#e5e7eb" strokeWidth={1} />
 
-      {/* Risk curve */}
-      <polyline points={curvePts} fill="none" stroke="#374151" strokeWidth={1.5} strokeLinejoin="round" />
+      {/* seuils : la ou le modele bascule. L'etiquette n'apparait que si elle a
+          la place — sinon elle se superpose aux bornes de l'axe ou a sa voisine. */}
+      {segs.slice(1).map((seg, i) => {
+        const x = toX(seg.debut);
+        const precedent = i > 0 ? toX(segs[i].debut) : -Infinity;
+        const lisible = x - PX > 30 && (W - PX) - x > 20 && x - precedent > 14;
+        return (
+          <g key={`s${seg.classe}`}>
+            <line x1={x} y1={PY} x2={x} y2={PY + plotH}
+              stroke="#cbd5e1" strokeWidth={1} strokeDasharray="2 2" />
+            {lisible && (
+              <text x={x} y={H - 2} fontSize={6.5} fill="#64748b"
+                textAnchor="middle" fontWeight="600">
+                {Math.round(seg.debut)}
+              </text>
+            )}
+          </g>
+        );
+      })}
 
-      {/* X-axis baseline */}
-      <line x1={PX} y1={bottomY} x2={W - PX} y2={bottomY} stroke="#e5e7eb" strokeWidth={1} />
+      <path d={trace} fill="none" stroke="#374151" strokeWidth={1.6}
+        strokeLinejoin="round" strokeLinecap="round" />
 
-      {/* X-axis labels: min | optimal midpoint | max */}
-      <text x={PX}     y={H - 3} fontSize={7} fill="#9ca3af" textAnchor="start">{cfg.min}{cfg.unit ? ` ${cfg.unit}` : ""}</text>
-      <text x={W / 2}  y={H - 3} fontSize={7} fill="#6b7280" textAnchor="middle">{optMidVal}</text>
-      <text x={W - PX} y={H - 3} fontSize={7} fill="#9ca3af" textAnchor="end">{cfg.max}</text>
-
-      {/* Patient drop-line */}
-      <line x1={dotX} y1={dotY + 5} x2={dotX} y2={bottomY - 1}
+      {/* position du patient */}
+      <line x1={xPatient} y1={yPatient} x2={xPatient} y2={PY + plotH}
         stroke="#ef4444" strokeWidth={1} strokeDasharray="2.5 2" />
+      <circle cx={xPatient} cy={yPatient} r={4} fill="#ef4444" stroke="white" strokeWidth={1.5} />
+      <text x={xPatient} y={yPatient - 6 < PY + 6 ? yPatient + 11 : yPatient - 6}
+        fontSize={7.5} fontWeight="700" fill="#ef4444"
+        textAnchor={xPatient < PX + 28 ? "start" : xPatient > W - PX - 28 ? "end" : "middle"}>
+        {courant ? `${courant.shap > 0 ? "+" : ""}${courant.shap.toFixed(2)}` : ""}
+      </text>
 
-      {/* Patient dot */}
-      <circle cx={dotX} cy={dotY} r={4.5} fill="#ef4444" stroke="white" strokeWidth={1.5} />
-
-      {/* Sim label */}
-      <text x={dotX} y={dotY - 7} fontSize={7.5} fill="#ef4444"
-        textAnchor={labelAnchor} fontWeight="700">
-        {value}{cfg.unit ? ` ${cfg.unit}` : ""}
+      <text x={PX} y={H - 2} fontSize={6.5} fill="#9ca3af" textAnchor="start">
+        {cfg.min}{cfg.unit ? ` ${cfg.unit}` : ""}
+      </text>
+      <text x={W - PX} y={H - 2} fontSize={6.5} fill="#9ca3af" textAnchor="end">{cfg.max}</text>
+      <text x={PX} y={PY - 3} fontSize={6} fill="#9ca3af" textAnchor="start">
+        effet SHAP sur le mRS
       </text>
     </svg>
   );
@@ -251,7 +509,9 @@ function RiskCurveChart({ cfg, meta, value }: { cfg: SliderConfig; meta: FactorM
 
 // ── Factor Row ───────────────────────────────────────────────────────────────
 
-function FactorRow({ cfg, value }: { cfg: SliderConfig; value: number }) {
+function FactorRow({ cfg, value, variable }: {
+  cfg: SliderConfig; value: number; variable?: ShapVariable;
+}) {
   const { open, setOpen, ref } = usePopup();
   const meta = FACTOR_META[cfg.key];
   const atRisk = isAtRisk(cfg, value);
@@ -283,59 +543,51 @@ function FactorRow({ cfg, value }: { cfg: SliderConfig; value: number }) {
         {value}{cfg.unit ? <span className="text-[9px] font-normal ml-0.5">{cfg.unit}</span> : null}
       </div>
       <div className="flex-1 min-w-0">
-        <RiskCurveChart cfg={cfg} meta={meta} value={value} />
+        {variable
+          ? <ShapCurveChart cfg={cfg} variable={variable} value={value} />
+          : <div className="h-[72px] flex items-center text-[10px] text-gray-300">
+              en attente du modele…
+            </div>}
       </div>
     </div>
   );
 }
 
-// ── Slider PDP Mini Curve ────────────────────────────────────────────────────
+// ── Mini courbe SHAP sous le curseur ─────────────────────────────────────────
 
-function SliderPdpCurve({ cfg, value }: { cfg: SliderConfig; value: number }) {
-  const meta = FACTOR_META[cfg.key];
-  if (!meta) return null;
+function SliderShapCurve({ cfg, variable }: {
+  cfg: SliderConfig; variable: ShapVariable | undefined;
+}) {
+  if (!variable) return null;
+  const VW = 100, VH = 22, PY = 2;
+  const segs = segments(cfg, variable);
+  const ampli = Math.max(0.02, ...segs.map((s) => Math.abs(s.shap)));
+  const zeroY = PY + (VH - PY * 2) / 2;
+  const toX = (v: number) => ((v - cfg.min) / (cfg.max - cfg.min)) * VW;
+  const toY = (shap: number) => zeroY - (shap / ampli) * ((VH - PY * 2) / 2);
 
-  const VW = 100, VH = 22, N = 80;
-  const PY = 1, axisY = VH, plotH = axisY - PY;
-  const [optLow, optHigh] = meta.optimalRange;
-
-  function riskAt(x: number): number {
-    const floor = 0.04;
-    if (x < optLow) {
-      const t = (optLow - x) / Math.max(1, optLow - cfg.min);
-      return floor + (1 - floor) * Math.pow(t, 1.8);
-    }
-    if (x > optHigh) {
-      const t = (x - optHigh) / Math.max(1, cfg.max - optHigh);
-      return floor + (1 - floor) * Math.pow(t, 1.8);
-    }
-    return floor;
-  }
-
-  function toX(x: number) { return ((x - cfg.min) / (cfg.max - cfg.min)) * VW; }
-  function toY(r: number) { return axisY - r * plotH; }
-
-  const pts = Array.from({ length: N + 1 }, (_, i) => {
-    const x = cfg.min + (cfg.max - cfg.min) * (i / N);
-    return { vx: toX(x), vy: toY(riskAt(x)) };
-  });
-
-  const curvePts = pts.map((p) => `${p.vx.toFixed(1)},${p.vy.toFixed(1)}`).join(" ");
-
-  const simX = toX(value);
+  const trace = tracéLisse(
+    segs.map((seg) => ({ x0: toX(seg.debut), x1: toX(seg.fin), y: toY(seg.shap) })),
+    6,
+  );
 
   return (
-    <svg width="100%" height={VH} viewBox={`0 0 ${VW} ${VH}`} preserveAspectRatio="none" className="w-full">
-      <polyline points={curvePts} fill="none" stroke="#22c55e" strokeWidth="0.9" strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={0.85} />
-      <line x1={simX} y1={PY} x2={simX} y2={axisY} stroke="#ef4444" strokeWidth="0.9" vectorEffect="non-scaling-stroke" opacity={0.75} />
+    <svg width="100%" height={VH} viewBox={`0 0 ${VW} ${VH}`}
+      preserveAspectRatio="none" className="w-full">
+      <line x1={0} y1={zeroY} x2={VW} y2={zeroY} stroke="#e5e7eb"
+        strokeWidth="0.6" vectorEffect="non-scaling-stroke" />
+      <path d={trace} fill="none" stroke="#22c55e" strokeWidth="0.9"
+        strokeLinejoin="round" vectorEffect="non-scaling-stroke" opacity={0.85} />
     </svg>
   );
 }
 
 // ── Slider Row ───────────────────────────────────────────────────────────────
 
-function SliderRow({ cfg, value, baseline, onChange }: {
-  cfg: SliderConfig; value: number; baseline: number; onChange: (v: number) => void;
+function SliderRow({ cfg, value, baseline, onChange, variable, variableBase }: {
+  cfg: SliderConfig; value: number; baseline: number;
+  onChange: (v: number) => void;
+  variable?: ShapVariable; variableBase?: ShapVariable;
 }) {
   const atRisk = isAtRisk(cfg, value);
   const pct = ((value - cfg.min) / (cfg.max - cfg.min)) * 100;
@@ -356,7 +608,7 @@ function SliderRow({ cfg, value, baseline, onChange }: {
             style={{ borderColor: atRisk ? "#ef4444" : "#e5e7eb" }}
           >
             <input
-              type="number" min={cfg.min} max={cfg.max} value={value}
+              type="number" min={cfg.min} max={cfg.max} step={cfg.step ?? 1} value={value}
               onChange={(e) => onChange(Math.max(cfg.min, Math.min(cfg.max, Number(e.target.value))))}
               className="w-full text-lg font-bold bg-transparent outline-none tabular-nums"
               style={{ color: atRisk ? "#ef4444" : "#1e293b" }}
@@ -371,10 +623,8 @@ function SliderRow({ cfg, value, baseline, onChange }: {
     );
   }
 
-  // Discrete step slider (e.g. prestroke_mrs)
-  if (cfg.step && cfg.step >= 1) {
-    return null;
-  }
+  // Discrete parameters have no control of their own; the header shows them.
+  if (cfg.step && cfg.step >= 1) return null;
 
   return (
     <div className="flex flex-col gap-0.5">
@@ -391,14 +641,16 @@ function SliderRow({ cfg, value, baseline, onChange }: {
           </span>
         </div>
       </div>
-      <SliderPdpCurve cfg={cfg} value={value} />
+      <SliderShapCurve cfg={cfg} variable={variable} />
       <div className="relative flex items-center h-5">
         <div className="absolute w-full h-2 rounded-full bg-gray-100" />
         {delta !== 0 && (() => {
           const left = Math.min(baselinePct, pct);
           const width = Math.abs(pct - baselinePct);
           const barColor = delta > 0 ? "#ef4444" : "#22c55e";
-          const riskDelta = Math.round(riskScore(cfg, value) - riskScore(cfg, baseline));
+          // Ecart d'effet mesure par le modele, pas une regle inventee.
+          const ecartShap = variable && variableBase
+            ? variable.shap_actuel - variableBase.shap_actuel : null;
           const midLeft = left + width / 2;
           return (
             <>
@@ -406,7 +658,9 @@ function SliderRow({ cfg, value, baseline, onChange }: {
                 className="absolute text-[9px] font-bold -top-4 whitespace-nowrap"
                 style={{ left: `${midLeft}%`, transform: "translateX(-50%)", color: barColor }}
               >
-                {riskDelta > 0 ? "+" : ""}{riskDelta}% risk
+                {ecartShap === null
+                  ? ""
+                  : `${ecartShap > 0 ? "+" : ""}${ecartShap.toFixed(2)} mRS`}
               </div>
               <div
                 className="absolute h-2 rounded-full transition-all"
@@ -422,7 +676,7 @@ function SliderRow({ cfg, value, baseline, onChange }: {
           <div className="w-0.5 h-5 bg-slate-500 rounded-full" />
         </div>
         <input
-          type="range" min={cfg.min} max={cfg.max} value={value}
+          type="range" min={cfg.min} max={cfg.max} step={cfg.step ?? 1} value={value}
           onChange={(e) => onChange(Number(e.target.value))}
           className="relative w-full h-2 appearance-none bg-transparent cursor-pointer"
           style={{ ["--thumb-color" as string]: color }}
@@ -541,9 +795,13 @@ function PatientIdDropdown({ selected, onChange }: { selected: string; onChange:
 
 // ── Risk Gauge ───────────────────────────────────────────────────────────────
 
-function RiskGauge({ pct }: { pct: number }) {
+/** `mrs` est la sortie du modele (continue). L'aiguille suit la valeur exacte,
+ *  le libelle affiche la classe arrondie. */
+function RiskGauge({ mrs: brut, enAttente }: { mrs: number | null; enAttente: boolean }) {
   const cx = 80, cy = 80, r = 60;
-  const mrs = mrsFromPct(pct);
+  const valeur = brut ?? 0;
+  const pct = Math.max(0, Math.min(100, (valeur / 5) * 100));
+  const mrs = Math.max(0, Math.min(5, Math.round(valeur)));
   const mrsColor = MRS_COLORS[mrs];
   const segSize = 180 / 6;
   const rLabel = r + 13;
@@ -582,8 +840,17 @@ function RiskGauge({ pct }: { pct: number }) {
         <circle cx={cx} cy={cy} r={6} fill="#1e293b" />
       </svg>
       <div className="text-center -mt-1">
-        <div className="text-xl font-bold" style={{ color: mrsColor }}>mRS {mrs}</div>
-        <div className="text-xs text-gray-500 leading-tight">{MRS_LABELS[mrs]}</div>
+        {brut === null ? (
+          <div className="text-sm text-gray-400">{enAttente ? "calcul…" : "modele indisponible"}</div>
+        ) : (
+          <>
+            <div className="text-xl font-bold" style={{ color: mrsColor }}>mRS {mrs}</div>
+            <div className="text-xs text-gray-500 leading-tight">{MRS_LABELS[mrs]}</div>
+            <div className="text-[10px] text-gray-400 tabular-nums">
+              prediction {brut.toFixed(2)}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -624,8 +891,6 @@ function getRecommendations(values: Record<string, number>, boolValues: Record<s
     recs.push({ factor: "Imaging", current: "Not completed", action: "Ensure urgent CT/MRI imaging is performed", reduction: "~18% diagnostic accuracy", source: "AHA/ASA Stroke Guidelines 2019", study: "Early neuroimaging is essential for differentiating ischemic from hemorrhagic stroke, directly influencing treatment eligibility and outcomes.", doi: "10.1161/STR.0000000000000211" });
   if (boolValues.risk_smoker)
     recs.push({ factor: "Smoking", current: "Active smoker", action: "Immediate smoking cessation support", reduction: "~20% stroke risk over 5 years", source: "Bonita et al. (1999) — Stroke", study: "Smoking cessation reduces stroke risk progressively; after 5 years, risk approximates that of non-smokers. Cessation counselling combined with pharmacotherapy doubles quit rates.", doi: "10.1161/01.STR.30.9.1831" });
-  if (boolValues.risk_arterialfibrilation)
-    recs.push({ factor: "Atrial Fibrillation", current: "Present", action: "Initiate anticoagulation therapy (NOAC/warfarin)", reduction: "~64% stroke risk reduction", source: "Hart et al. (2007) — Ann Intern Med", study: "Adjusted-dose warfarin reduced stroke by 64% vs. placebo in AF patients. NOACs show equivalent or superior efficacy with better safety profiles in large RCTs.", doi: "10.7326/0003-4819-146-12-200706190-00007" });
   return recs.sort((a, b) => parseImpact(b.reduction) - parseImpact(a.reduction));
 }
 
@@ -671,97 +936,133 @@ function RecCard({ rec }: { rec: Rec }) {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const initialValues = Object.fromEntries(SLIDERS.map((s) => [s.key, s.default]));
-const initialBools: Record<string, boolean> = {
-  risk_hypertension: true,
-  risk_diabetes: false,
-  risk_smoker: true,
-  risk_arterialfibrilation: false,
-  prenotification: false,
-  hospitalized_in: true,
-  bleeding_volume_value: false,
-  imaging_done: true,
-  occup_physiotherapy_received: false,
-  discharge_antiplatlets_any: true,
-  Discharge_anticoagulents_any: false,
-};
-
-// ── LIGNE AJOUTÉE ICI ────────────────────────────────────────────────────────
+// Sliders that have a risk curve chart (continuous, non-discrete)
 const CHART_SLIDERS = SLIDERS.filter((s) => FACTOR_META[s.key]);
 
-// Sliders that have distribution charts (continuous, non-discrete, not tiles)
 export default function App() {
-  // 1. Les "mémoires" de l'interface (on met ton patient de test par défaut)
-  const [patientId, setPatientId] = useState("dfngrvjkictscmy");
+  // The selected patient is restored from the URL / last session, so a reload
+  // stays on the patient that was on screen instead of jumping back to the first.
+  const [patientId, setPatientId] = useState<string>(readInitialPatientId);
   const [baseline, setBaseline] = useState<Record<string, number>>(initialValues);
   const [values, setValues] = useState<Record<string, number>>(initialValues);
   const [boolValues, setBoolValues] = useState<Record<string, boolean>>(initialBools);
-  
-  // Nouvelle mémoire pour stocker toutes les données brutes du patient
-  const [patientData, setPatientData] = useState<any>(null);
+  const [patientData, setPatientData] = useState<ApiRecord | null>(null);
+  const [explication, setExplication] = useState<Explication | null>(null);
+  // Explication du patient reel, conservee pour mesurer l'ecart d'une simulation.
+  const [reference, setReference] = useState<Explication | null>(null);
+  const [calcul, setCalcul] = useState(false);
 
-  // 2. Le déclencheur API (s'exécute à chaque changement de patientId)
+  // Fetches the patient on mount, on every selection change and on a manual reload.
   useEffect(() => {
-    const fetchPatient = async () => {
-      if (!patientId) return;
+    if (!patientId) return;
+    rememberPatientId(patientId);
 
+    const controller = new AbortController();
+    let cancelled = false;
+
+    (async () => {
       try {
-        const response = await fetch(`http://127.0.0.1:8000/patient/${patientId}`);
-        if (response.ok) {
-          const data = await response.json();
-          const p = data.donnees;
-          
-          setPatientData(p);
-          console.log("✅ Données patient :", p);
+        const response = await fetch(
+          `${API_BASE}/patient/${encodeURIComponent(patientId)}`,
+          { signal: controller.signal },
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
 
-          // On met à jour les sliders avec les vraies valeurs du patient
-          setValues((prev) => {
-            const newVals = { ...prev };
-            Object.keys(newVals).forEach((key) => {
-              if (p[key] !== undefined && p[key] !== null) newVals[key] = Number(p[key]);
-            });
-            return newVals;
-          });
+        const payload = await response.json();
+        const raw: unknown = payload?.donnees ?? payload?.data ?? payload;
+        if (!raw || typeof raw !== "object") throw new Error("Unexpected payload shape");
+        if (cancelled) return;
 
-          // On définit la baseline avec ces mêmes valeurs
-          setBaseline((prev) => {
-            const newBase = { ...prev };
-            Object.keys(newBase).forEach((key) => {
-              if (p[key] !== undefined && p[key] !== null) newBase[key] = Number(p[key]);
-            });
-            return newBase;
-          });
+        // Explication du patient tel qu'il est dans le registre.
+        const rExp = await fetch(`${API_BASE}/explain/${encodeURIComponent(patientId)}`,
+                                 { signal: controller.signal });
+        const exp: Explication | null = rExp.ok ? await rExp.json() : null;
+        if (cancelled) return;
+        setExplication(exp);
+        setReference(exp);
 
-          // On met à jour les toggles booléens
-          setBoolValues((prev) => {
-            const newBools = { ...prev };
-            Object.keys(newBools).forEach((key) => {
-              if (p[key] !== undefined && p[key] !== null) newBools[key] = Boolean(p[key]);
-            });
-            return newBools;
-          });
-        }
+        // The payload keys are the registry's, not the UI's — map before use.
+        const mapped = mapPatient(raw as ApiRecord);
+        setPatientData(raw as ApiRecord);
+        setValues(mapped.values);
+        setBaseline(mapped.values);
+        setBoolValues(mapped.bools);
       } catch (error) {
-        console.error("❌ Erreur de connexion API :", error);
+        if (cancelled || (error as Error)?.name === "AbortError") return;
+        // Fall back to the placeholders, but flag it: showing them silently is
+        // what made a disconnected UI look like live patient data.
+        setPatientData(null);
+        setExplication(null);
+        setReference(null);
+        setValues(initialValues);
+        setBaseline(initialValues);
+        setBoolValues(initialBools);
+        console.error(`API ${API_BASE}/patient/${patientId} :`, error);
       }
-    };
+    })();
 
-    fetchPatient();
+    // A slower answer for a previously selected patient must not overwrite the
+    // current one.
+    return () => { cancelled = true; controller.abort(); };
   }, [patientId]);
 
-  // 3. Calculs internes (à remplacer plus tard par la route /predict)
-  const risk = overallRisk(values, boolValues);
+  // Simulation : toute modification de curseur repart au modele. Tant que les
+  // valeurs sont celles du patient, le GET initial suffit — inutile de rejouer.
+  const identique = SLIDERS.every((s) => values[s.key] === baseline[s.key]);
+  useEffect(() => {
+    if (!patientId || !patientData || identique) return;
+
+    const controller = new AbortController();
+    let annule = false;
+    setCalcul(true);
+
+    const minuteur = setTimeout(async () => {
+      try {
+        const valeurs: Record<string, number> = {};
+        for (const cfg of SLIDERS) {
+          const colonne = API_COLUMN[cfg.key];
+          if (colonne) valeurs[colonne] = versRegistre(cfg.key, values[cfg.key]);
+        }
+        const r = await fetch(`${API_BASE}/explain/${encodeURIComponent(patientId)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ valeurs }),
+          signal: controller.signal,
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const exp: Explication = await r.json();
+        if (!annule) setExplication(exp);
+      } catch (error) {
+        if (!annule && (error as Error)?.name !== "AbortError") {
+          console.error("simulation :", error);
+        }
+      } finally {
+        if (!annule) setCalcul(false);
+      }
+    }, 300);   // laisse le curseur se stabiliser avant d'appeler le modele
+
+    return () => { annule = true; controller.abort(); clearTimeout(minuteur); };
+  }, [patientId, patientData, identique, values]);
+
+  const variablePour = (key: string) => explication?.variables[API_COLUMN[key] ?? ""];
+  const variableBasePour = (key: string) => reference?.variables[API_COLUMN[key] ?? ""];
   const recs = getRecommendations(values, boolValues);
 
-  // 4. Infos patient dynamiques (si on a les données, on les affiche, sinon on met des tirets)
-  const patientInfo: [string, React.ReactNode][] = patientData ? [
-    ["Age", patientData.age || "-"], 
-    ["Gender", patientData.gender || "-"], 
-    ["Stroke Type", patientData.stroke_type || "-"], 
-    ["Pre-stroke mRS", patientData.prestroke_mrs || "-"],
-    ["mRS Discharge", patientData.discharge_mrs || "-"]
-  ] : [
-    ["Age", "-"], ["Gender", "-"], ["Stroke Type", "-"], ["Pre-stroke mRS", "-"], ["mRS Discharge", "-"]
+  // Header facts, straight from the payload. `|| "-"` used to hide a legitimate
+  // value of 0 (a very common pre-stroke mRS), so test for absence instead.
+  const readInfo = (names: string[]) => {
+    const v = readField(patientData ?? {}, names);
+    if (v === undefined) return "-";
+    const n = toNumber(v);
+    return n !== undefined ? String(Number(n.toFixed(2))) : String(v);
+  };
+
+  const patientInfo: [string, React.ReactNode][] = [
+    ["Age", readInfo(["age"])],
+    ["Gender", readInfo(["gender"])],
+    ["Stroke Type", readInfo(["stroke_type", "strokeType"])],
+    ["Pre-stroke mRS", readInfo(["prestroke_mrs", "prestrokeMrs"])],
+    ["mRS Discharge", readInfo(["discharge_mrs", "dischargeMrs"])],
   ];
 
   return (
@@ -792,7 +1093,8 @@ export default function App() {
             <SectionTitle title="Factors Contributing to Risk" />
             <div className="overflow-y-auto flex-1 flex flex-col gap-3">
               {CHART_SLIDERS.map((cfg) => (
-                <FactorRow key={cfg.key} cfg={cfg} value={values[cfg.key]} />
+                <FactorRow key={cfg.key} cfg={cfg} value={values[cfg.key]}
+                  variable={variablePour(cfg.key)} />
               ))}
             </div>
           </div>
@@ -817,7 +1119,7 @@ export default function App() {
 
           {/* mRS Gauge */}
           <div className="bg-white rounded-xl border border-gray-200 shadow-sm flex items-center justify-center px-4 py-2 shrink-0">
-            <RiskGauge pct={risk} />
+            <RiskGauge mrs={explication?.prediction.mrs ?? null} enAttente={calcul} />
           </div>
 
           {/* Patient Parameters */}
@@ -832,6 +1134,8 @@ export default function App() {
                   cfg={cfg}
                   value={values[cfg.key]}
                   baseline={baseline[cfg.key]}
+                  variable={variablePour(cfg.key)}
+                  variableBase={variableBasePour(cfg.key)}
                   onChange={(v) => setValues((prev) => ({ ...prev, [cfg.key]: v }))}
                 />
               ))}
@@ -850,6 +1154,7 @@ export default function App() {
                   />
                 ))}
               </div>
+
             </div>
           </div>
         </div>
